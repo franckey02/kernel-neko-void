@@ -1,0 +1,117 @@
+name: Compilar Zen Kernel (lqx1) para Void Linux
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/void-linux/void-glibc-full:latest
+      options: --user root
+
+    steps:
+      - name: 1. Instalar dependencias del sistema
+        run: |
+          xbps-install -Syu xbps -y
+          xbps-install -Syu base-devel git bc kmod elfutils-devel bash cpio xz lz4 zstd flex bison openssl-devel curl pahole tar python3 patch wget rsync -y
+
+      - name: 2. Checkout de TU repositorio (para scripts personalizados si los hay)
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: 3. Clonar fuentes del Zen Kernel (v6.18.12-lqx1)
+        run: |
+          git clone --depth 1 --branch v6.18.12-lqx1 https://github.com/zen-kernel/zen-kernel.git linux-src
+
+      - name: 4. Obtener configuración base de Void (linux6.18)
+        run: |
+          cd linux-src
+          wget -O .config https://github.com/void-linux/void-packages/raw/refs/heads/master/srcpkgs/linux6.18/files/x86_64-dotconfig || \
+          wget -O .config https://raw.githubusercontent.com/void-linux/void-packages/master/srcpkgs/linux6.12/files/x86_64-dotconfig
+          cd ..
+
+      - name: 5. Ajustar configuración (nombre, optimizaciones, debug)
+        run: |
+          cd linux-src
+          # Evitar sufijo -dirty (por si acaso)
+          scripts/config --disable CONFIG_LOCALVERSION_AUTO
+          # Añadir identificador personal (el nombre final será algo como 6.18.12-lqx1-neko)
+          scripts/config --set-str CONFIG_LOCALVERSION "-neko"
+          
+          # Optimizaciones
+          scripts/config --enable CONFIG_CC_OPTIMIZE_FOR_SIZE
+          scripts/config --enable CONFIG_MODULE_COMPRESS_ZSTD
+          
+          # Desactivar debug masivo
+          scripts/config --disable CONFIG_DEBUG_INFO \
+                         --disable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
+                         --disable CONFIG_DEBUG_INFO_REDUCED \
+                         --disable CONFIG_DEBUG_INFO_BTF \
+                         --disable CONFIG_DEBUG_VM \
+                         --disable CONFIG_DEBUG_KERNEL \
+                         --disable CONFIG_PROVE_LOCKING \
+                         --disable CONFIG_LOCK_STAT \
+                         --disable CONFIG_LATENCYTOP
+          
+          # Desactivar firma de módulos
+          scripts/config --disable CONFIG_MODULE_SIG
+          scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
+          
+          # Actualizar configuración (incorpora nuevas opciones)
+          make olddefconfig
+          cd ..
+
+      - name: 6. Compilar kernel y módulos (con logs detallados)
+        run: |
+          cd linux-src
+          export KBUILD_BUILD_TIMESTAMP=$(date -u -d @0 +"%Y-%m-%d %H:%M:%S")
+          export KBUILD_BUILD_USER=voidlinux
+          export KBUILD_BUILD_HOST=voidlinux
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          
+          make -j$(nproc) prepare
+          make -j$(nproc) bzImage modules V=1 2>&1 | tee ../build.log
+          cd ..
+
+      - name: 7. Subir logs de compilación (incluso si falla)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: build.log
+
+      - name: 8. Instalar kernel, módulos y config (solo si la compilación fue exitosa)
+        if: success()
+        run: |
+          cd linux-src
+          KERNEL_RELEASE=$(make kernelrelease)
+          echo "KERNEL_RELEASE=${KERNEL_RELEASE}" >> $GITHUB_ENV
+          
+          make INSTALL_MOD_PATH=$GITHUB_WORKSPACE/modules modules_install
+          
+          mkdir -p $GITHUB_WORKSPACE/pkg/boot
+          cp arch/x86/boot/bzImage $GITHUB_WORKSPACE/pkg/boot/vmlinuz-${KERNEL_RELEASE}
+          cp System.map $GITHUB_WORKSPACE/pkg/boot/System.map-${KERNEL_RELEASE}
+          cp .config $GITHUB_WORKSPACE/pkg/boot/config-${KERNEL_RELEASE}
+          
+          mkdir -p $GITHUB_WORKSPACE/pkg/lib/modules
+          mv $GITHUB_WORKSPACE/modules/lib/modules/${KERNEL_RELEASE} $GITHUB_WORKSPACE/pkg/lib/modules/
+          cd ..
+
+      - name: 9. Empaquetar artefactos
+        if: success()
+        run: |
+          cd $GITHUB_WORKSPACE/pkg
+          tar -czf ../zen-kernel-void-${KERNEL_RELEASE}.tar.gz .
+          cd ..
+
+      - name: 10. Subir resultado
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zen-kernel-void-lqx1
+          path: zen-kernel-void-*.tar.gz
